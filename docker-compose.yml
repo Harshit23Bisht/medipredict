@@ -1,0 +1,100 @@
+version: "3.8"
+
+services:
+  # =========================================================
+  # 🐘 POSTGRESQL DATABASE (Structured Clinical Data)
+  # =========================================================
+  postgres:
+    image: postgres:16
+    container_name: medipredict_postgres
+
+    environment:
+      POSTGRES_DB: medipredict
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: hb23
+
+    volumes:
+      # Persistent DB storage
+      - postgres_data:/var/lib/postgresql/data
+
+      # Automatically runs schema.sql on first startup
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/schema.sql
+
+    ports:
+      - "5432:5432"
+
+    # Ensures DB is ready before other services start
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # =========================================================
+  # 🍃 MONGODB (Images, Notes, Embeddings)
+  # =========================================================
+  mongodb:
+    image: mongo:7
+    container_name: medipredict_mongo
+
+    volumes:
+      # Persistent MongoDB storage
+      - mongo_data:/data/db
+
+    ports:
+      - "27017:27017"
+
+    # Health check to ensure Mongo is running
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # =========================================================
+  # ⚙️ FASTAPI BACKEND (Your main logic)
+  # =========================================================
+  api:
+    build: .
+    container_name: medipredict_api
+
+    # Loads environment variables (.env)
+    env_file: .env
+
+    volumes:
+      # Mounts local data folder into container
+      - ./data:/app/data
+
+    ports:
+      - "8001:8001"
+
+    # Waits for DBs before starting
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mongodb:
+        condition: service_healthy
+
+    # Runs FastAPI server
+    command: uvicorn api.main:app --host 0.0.0.0 --port 8001 --reload
+
+  # =========================================================
+  # 🌐 FRONTEND (Static UI via NGINX)
+  # =========================================================
+  frontend:
+    image: nginx:alpine
+    container_name: medipredict_frontend
+
+    volumes:
+      # Serves frontend files
+      - ./frontend:/usr/share/nginx/html
+
+    ports:
+      - "3000:80"
+
+# =========================================================
+# 💾 PERSISTENT STORAGE
+# =========================================================
+volumes:
+  postgres_data:
+  mongo_data:
