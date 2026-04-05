@@ -1,5 +1,33 @@
-.env
+# Python
+venv/
 __pycache__/
 *.pyc
-venv/
+*.pkl
+*.egg-info/
+
+# Data — NEVER push MIMIC data (violates data use agreement)
 data/raw/
+data/processed/
+*.csv
+*.parquet
+*.gz
+
+# Environment — contains passwords
+.env
+
+# Models
+data/models/
+*.pkl
+*.h5
+*.pt
+
+# Jupyter
+.ipynb_checkpoints/
+notebooks/.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
