@@ -297,30 +297,30 @@ if __name__ == "__main__":
     print("MediPredict ETL — MIMIC-IV → PostgreSQL")
     print("=" * 55)
 
-    print("\nClearing existing data...")
-    with engine.connect() as conn:
-        conn.execute(text("""
-            TRUNCATE TABLE
-                risk_prediction,
-                vital_sign,
-                lab_result,
-                medication,
-                diagnosis,
-                icu_stay,
-                encounter,
-                patient
-            CASCADE;
-        """))
-        conn.commit()
-    print("  Cleared ✅")
+    # print("\nClearing existing data...")
+    # with engine.connect() as conn:
+    #     conn.execute(text("""
+    #         TRUNCATE TABLE
+    #             risk_prediction,
+    #             vital_sign,
+    #             lab_result,
+    #             medication,
+    #             diagnosis,
+    #             icu_stay,
+    #             encounter,
+    #             patient
+    #         CASCADE;
+    #     """))
+    #     conn.commit()
+    # print("  Cleared ✅")
 
-    load_patients()
-    load_encounters()
-    load_icu_stays()
-    load_diagnoses()
+    # load_patients()
+    # load_encounters()
+    # load_icu_stays()
+    # load_diagnoses()
     load_medications()
-    load_vitals()
-    load_labs()
+    # # load_vitals()
+    # load_labs()
 
     print("\n" + "=" * 55)
     print("✅ ETL Complete!")
