@@ -1,0 +1,21 @@
+# Ignore data
+data/
+data/raw/
+data/processed/
+
+# Ignore models
+data/models/
+
+# Ignore environment
+.env
+venv/
+
+# Ignore git
+.git
+.gitignore
+
+# Ignore notebooks
+notebooks/
+
+# Ignore logs
+*.log
