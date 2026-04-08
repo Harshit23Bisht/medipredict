@@ -48,13 +48,45 @@ FEATURE_COLS = [
     "length_of_stay",
     "num_diagnoses",
     "num_medications",
-    "avg_hr",
-    "max_bp_sys",
-    "avg_temp",
     "max_creatinine",
     "max_wbc",
     "num_prior_admissions",
 ]
+
+# ─────────────────────────────────────────────────────────────
+# 0. Data Quality Diagnostic
+# ─────────────────────────────────────────────────────────────
+def run_diagnostic():
+    """
+    Prints row counts at each stage so you can see exactly where
+    encounters are being lost.  Run once — if encounter_features
+    << encounter table, the view is filtering too aggressively
+    (likely INNER JOINs to vital_sign / lab_result that drop
+    encounters with no ICU data).  Switch those to LEFT JOINs
+    in the view definition.
+    """
+    checks = {
+        "encounter table":        "SELECT COUNT(*) FROM encounter",
+        "encounter_features view":"SELECT COUNT(*) FROM encounter_features",
+        "readmission_label view": "SELECT COUNT(*) FROM readmission_label",
+        "readmitted_30d = 1":     "SELECT COUNT(*) FROM readmission_label WHERE readmitted_30d = 1",
+        "after JOIN + LOS > 0":  """
+            SELECT COUNT(*) FROM encounter_features ef
+            JOIN readmission_label rl ON rl.encounter_id = ef.encounter_id
+            WHERE ef.length_of_stay > 0
+        """,
+    }
+    print("\n── Data Quality Diagnostic ──────────────────────────")
+    with engine.connect() as conn:
+        for label, q in checks.items():
+            n = conn.execute(text(q)).scalar()
+            print(f"  {label:<30} : {n:>10,}")
+    print()
+    print("  ⚠️  If 'encounter_features view' << 'encounter table',")
+    print("       open the view in pgAdmin and change INNER JOINs")
+    print("       to LEFT JOINs on vital_sign and lab_result.")
+    print("────────────────────────────────────────────────────\n")
+
 
 # ─────────────────────────────────────────────────────────────
 # 1. Load
@@ -85,10 +117,26 @@ def load_data() -> pd.DataFrame:
     """)
     with engine.connect() as conn:
         df = pd.read_sql(query, conn)
+        # 🔥 FIX: better missing handling
+        df[FEATURE_COLS] = df[FEATURE_COLS].fillna(df[FEATURE_COLS].median())
 
     print(f"  Total encounters : {len(df):,}")
     print(f"  Readmission rate : {df['label'].mean():.2%}")
     print(f"  Date range       : {df['admit_date'].min()} → {df['admit_date'].max()}")
+
+    # ── Warn if data looks suspicious ────────────────────────
+    if len(df) < 50_000:
+        print("\n  ⚠️  WARNING: Only {:,} rows loaded (expected ~245k).".format(len(df)))
+        print("     Run run_diagnostic() to find where rows are lost.")
+        print("     Most likely fix: change INNER JOINs → LEFT JOINs in")
+        print("     the encounter_features view definition.\n")
+
+    if df['label'].mean() < 0.05:
+        print(f"\n  ⚠️  WARNING: Readmission rate is {df['label'].mean():.2%} (expected ~20%).")
+        print("     The readmission_label view may not be computing correctly.")
+        print("     Verify the LEAD window function spans all encounters,")
+        print("     not just the filtered subset.\n")
+
     return df
 
 
@@ -117,29 +165,38 @@ def split_data(df: pd.DataFrame):
 def train_model(train: pd.DataFrame, val: pd.DataFrame):
     print("\nTraining XGBoost...")
 
+    # ✅ Use ORIGINAL data (NO UPSAMPLING)
     X_train = train[FEATURE_COLS].fillna(0).astype(float)
     y_train = train["label"].astype(int)
-    X_val   = val[FEATURE_COLS].fillna(0).astype(float)
-    y_val   = val["label"].astype(int)
 
-    pos            = int(y_train.sum())
-    neg            = len(y_train) - pos
-    scale_pos_wt   = neg / pos
+    X_val = val[FEATURE_COLS].fillna(0).astype(float)
+    y_val = val["label"].astype(int)
+
+    # ✅ Proper class imbalance handling
+    pos = int(y_train.sum())
+    neg = len(y_train) - pos
+    scale_pos_wt = neg / pos if pos > 0 else 1.0
+
     print(f"  scale_pos_weight : {scale_pos_wt:.2f}  "
           f"(pos={pos:,}  neg={neg:,})")
 
+    # ✅ Stable model (prevents overfitting on weak data)
     model = XGBClassifier(
-        n_estimators          = 500,
-        max_depth             = 5,
-        learning_rate         = 0.05,
-        subsample             = 0.8,
-        colsample_bytree      = 0.8,
-        scale_pos_weight      = scale_pos_wt,
-        eval_metric           = "auc",
-        early_stopping_rounds = 20,
-        tree_method           = "hist",   # fast on CPU; auto-uses GPU if available
-        random_state          = 42,
-        n_jobs                = -1,
+        n_estimators=150,
+        max_depth=3,
+        learning_rate=0.03,
+        min_child_weight=20,
+        gamma=1.0,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        reg_alpha=1.0,
+        reg_lambda=3.0,
+        scale_pos_weight=scale_pos_wt,
+        eval_metric="auc",
+        early_stopping_rounds=50,
+        tree_method="hist",
+        random_state=42,
+        n_jobs=-1,
     )
 
     model.fit(
@@ -200,7 +257,6 @@ def save_plots(model, X_train, y_train,
                test_prob, test_pred, test_auc):
     print("\nSaving plots → eda_plots/ ...")
 
-    # ── ROC Curve ────────────────────────────────────────────
     fpr, tpr, _ = roc_curve(y_test, test_prob)
     plt.figure(figsize=(7, 6))
     plt.plot(fpr, tpr, color="#2196F3", lw=2.5,
@@ -214,7 +270,6 @@ def save_plots(model, X_train, y_train,
     plt.savefig("eda_plots/roc_curve.png", dpi=150)
     plt.close()
 
-    # ── Confusion Matrix ─────────────────────────────────────
     cm = confusion_matrix(y_test, test_pred)
     fig, ax = plt.subplots(figsize=(6, 5))
     ConfusionMatrixDisplay(
@@ -225,7 +280,6 @@ def save_plots(model, X_train, y_train,
     plt.savefig("eda_plots/confusion_matrix.png", dpi=150)
     plt.close()
 
-    # ── Feature Importance ───────────────────────────────────
     feat_imp = pd.Series(
         model.feature_importances_, index=FEATURE_COLS
     ).sort_values(ascending=True)
@@ -237,7 +291,6 @@ def save_plots(model, X_train, y_train,
     plt.savefig("eda_plots/feature_importance.png", dpi=150)
     plt.close()
 
-    # ── Baseline vs Model ────────────────────────────────────
     dummy = DummyClassifier(strategy="most_frequent")
     dummy.fit(X_train, y_train)
     try:
@@ -266,24 +319,16 @@ def save_plots(model, X_train, y_train,
     plt.savefig("eda_plots/model_comparison.png", dpi=150)
     plt.close()
 
-    # ── SHAP ─────────────────────────────────────────────────
     print("  Generating SHAP values...")
     try:
         explainer   = shap.TreeExplainer(model)
         shap_values = explainer.shap_values(X_test)
-
-        # shap_values is a plain ndarray for binary XGBClassifier
-        if isinstance(shap_values, list):
-            sv = shap_values[1]   # positive class
-        else:
-            sv = shap_values      # already (n_samples, n_features)
-
+        sv = shap_values[1] if isinstance(shap_values, list) else shap_values
         plt.figure()
         shap.summary_plot(sv, X_test, plot_type="bar", show=False)
         plt.title("SHAP Feature Importance", fontweight="bold")
         plt.tight_layout()
-        plt.savefig("eda_plots/shap_importance.png",
-                    dpi=150, bbox_inches="tight")
+        plt.savefig("eda_plots/shap_importance.png", dpi=150, bbox_inches="tight")
         plt.close()
         print("  SHAP plot saved ✅")
     except Exception as exc:
@@ -318,6 +363,9 @@ if __name__ == "__main__":
     print("=" * 52)
     print("MediPredict — XGBoost Training")
     print("=" * 52)
+
+    # Always run diagnostic first so problems are visible
+    run_diagnostic()
 
     df = load_data()
 
