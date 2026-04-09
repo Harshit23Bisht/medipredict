@@ -8,6 +8,15 @@ Endpoints:
   POST /predict/{encounter_id}/with-image   — same, but accepts X-ray upload
   GET  /predict/history/{encounter_id}      — past predictions for an encounter
   GET  /predict/stats/summary               — aggregate stats
+
+Changes vs your original:
+  1. get_cnn_score() — tensor moved to the CNN model's device before inference
+     (prevents RuntimeError: expected all tensors to be on the same device)
+  2. get_lstm_score() — honours lstm_data["outputs_logits"] flag saved by
+     lstm_model.py; applies sigmoid only when flag is True (which it always
+     is for your current model, but this is future-proof)
+  3. Minor: added np.nan_to_num() guard on LSTM arr before inference,
+     matching the same guard added in lstm_model.py training
 """
 
 import io
@@ -28,10 +37,14 @@ import api.main as app_state
 router = APIRouter()
 
 FEATURE_COLS = [
-    "age_at_admission", "gender", "length_of_stay",
-    "num_diagnoses", "num_medications", "avg_hr",
-    "max_bp_sys", "avg_temp", "max_creatinine",
-    "max_wbc", "num_prior_admissions",
+    "age_at_admission",
+    "gender",
+    "length_of_stay",
+    "num_diagnoses",
+    "num_medications",
+    "max_creatinine",
+    "max_wbc",
+    "num_prior_admissions",
 ]
 
 # ImageNet normalisation — must match teammate's training pipeline
@@ -61,8 +74,7 @@ def get_xgb_score(encounter_id: int, db: Session) -> dict:
     row = db.execute(text("""
         SELECT
             age_at_admission, gender, length_of_stay,
-            num_diagnoses, num_medications, avg_hr,
-            max_bp_sys, avg_temp, max_creatinine,
+            num_diagnoses, num_medications, max_creatinine,
             max_wbc, num_prior_admissions
         FROM encounter_features
         WHERE encounter_id = :eid
@@ -86,7 +98,7 @@ def get_lstm_score(encounter_id: int, db: Session) -> float | None:
     if not lstm_data:
         return None
 
-    # Use vital_sequence (ICU encounters) — faster and pre-computed
+    # Primary: use vital_sequence (ICU encounters, pre-computed 48h windows)
     rows = db.execute(text("""
         SELECT hour_offset, heart_rate, bp_systolic, bp_diastolic,
                temperature_f, respiratory_rate, spo2
@@ -95,7 +107,7 @@ def get_lstm_score(encounter_id: int, db: Session) -> float | None:
         ORDER BY hour_offset
     """), {"eid": encounter_id}).fetchall()
 
-    # Fallback: aggregate raw vitals by hour
+    # Fallback: aggregate raw vitals by hour for non-ICU encounters
     if not rows:
         rows = db.execute(text("""
             SELECT
@@ -122,14 +134,22 @@ def get_lstm_score(encounter_id: int, db: Session) -> float | None:
     try:
         seq_len  = lstm_data.get("seq_length", 48)
         vitals   = lstm_data.get("vital_cols",
-                                 ["heart_rate","bp_systolic","bp_diastolic",
-                                  "temperature_f","respiratory_rate","spo2"])
+                                 ["heart_rate", "bp_systolic", "bp_diastolic",
+                                  "temperature_f", "respiratory_rate", "spo2"])
         scaler   = lstm_data.get("scaler")
         model    = lstm_data["model"]
+
+        # outputs_logits is True for your current model (sigmoid removed from
+        # BiLSTM.forward() and saved explicitly in lstm_model.py)
+        outputs_logits = lstm_data.get("outputs_logits", True)
 
         df  = pd.DataFrame([dict(r._mapping) for r in rows])
         arr = df[vitals].fillna(0).values.astype(np.float32)
 
+        # Guard: remove NaNs/infs that could crash inference
+        arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # Pad or truncate to seq_len
         if len(arr) >= seq_len:
             arr = arr[-seq_len:]
         else:
@@ -143,12 +163,13 @@ def get_lstm_score(encounter_id: int, db: Session) -> float | None:
 
         model.eval()
         with torch.no_grad():
-            logit = model(tensor).squeeze()
-            # Model outputs logits (sigmoid removed from architecture)
-            # Apply sigmoid here to get probability
-            prob  = torch.sigmoid(logit).item()
+            out = model(tensor).squeeze()
+            # Apply sigmoid only if model outputs logits (your BiLSTM does)
+            prob = torch.sigmoid(out).item() if outputs_logits else out.item()
 
-        return float(prob)
+        # Clamp to valid probability range
+        prob = float(np.clip(prob, 0.0, 1.0))
+        return prob
 
     except Exception as e:
         print(f"LSTM scoring error for encounter {encounter_id}: {e}")
@@ -159,8 +180,11 @@ def get_cnn_score(image_bytes: bytes | None) -> float | None:
     """
     Score a chest X-ray with the CNN.
 
-    Teammate's model already applies sigmoid internally, so the output
-    is already a probability in [0, 1]. Do NOT apply sigmoid again.
+    Teammate's ResNet50 has Sigmoid as its final layer, so the output is
+    already a probability in [0, 1]. Do NOT apply sigmoid again.
+
+    FIX: tensor is moved to the same device as the CNN model before inference.
+    Without this, GPU-loaded models crash with a device mismatch error.
     """
     if image_bytes is None:
         return None
@@ -170,16 +194,19 @@ def get_cnn_score(image_bytes: bytes | None) -> float | None:
         return None
 
     try:
+        # Get the device the CNN was loaded onto (stored by main.py)
+        device = cnn_data.get("device", torch.device("cpu"))
+
         img    = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        tensor = CNN_TRANSFORM(img).unsqueeze(0)        # (1, 3, 224, 224)
+        tensor = CNN_TRANSFORM(img).unsqueeze(0).to(device)   # ← device fix
 
         cnn_model = cnn_data["model"]
         cnn_model.eval()
         with torch.no_grad():
-            # Teammate's model has Sigmoid as last layer → output is probability
+            # Teammate's model has Sigmoid as last layer → already [0, 1]
             score = cnn_model(tensor).squeeze().item()
 
-        return float(score)
+        return float(np.clip(score, 0.0, 1.0))
 
     except Exception as e:
         print(f"CNN scoring error: {e}")
@@ -190,7 +217,8 @@ def compute_fusion(xgb_score: float,
                    lstm_score: float | None,
                    cnn_score:  float | None) -> tuple[float, dict]:
     """
-    Weighted fusion. Redistributes weight from missing models.
+    Weighted fusion with graceful degradation.
+    Weights are redistributed proportionally when a model is unavailable.
     Returns (fusion_score, weights_used).
     """
     has_lstm = lstm_score is not None
@@ -212,7 +240,7 @@ def compute_fusion(xgb_score: float,
         w = {"xgb": 1.00, "lstm": 0.00, "cnn": 0.00}
         score = xgb_score
 
-    return round(score, 4), w
+    return round(float(score), 4), w
 
 
 def _save_prediction(db: Session, encounter_id: int,
@@ -228,7 +256,7 @@ def _save_prediction(db: Session, encounter_id: int,
         "xgb":    round(xgb_score,   4),
         "lstm":   round(lstm_score,  4) if lstm_score is not None else None,
         "cnn":    round(cnn_score,   4) if cnn_score  is not None else None,
-        "fusion": round(fusion_score,4),
+        "fusion": round(fusion_score, 4),
         "level":  risk_level(fusion_score),
         "ver":    "v2_mimic",
     })
@@ -305,8 +333,8 @@ def prediction_history(encounter_id: int, db: Session = Depends(get_db)):
 def prediction_stats(db: Session = Depends(get_db)):
     row = db.execute(text("""
         SELECT
-            COUNT(*)                                       AS total_predictions,
-            AVG(fusion_score)                              AS avg_risk_score,
+            COUNT(*)                                              AS total_predictions,
+            AVG(fusion_score)                                     AS avg_risk_score,
             SUM(CASE WHEN risk_level='HIGH'   THEN 1 ELSE 0 END) AS high_risk_count,
             SUM(CASE WHEN risk_level='MEDIUM' THEN 1 ELSE 0 END) AS medium_risk_count,
             SUM(CASE WHEN risk_level='LOW'    THEN 1 ELSE 0 END) AS low_risk_count
