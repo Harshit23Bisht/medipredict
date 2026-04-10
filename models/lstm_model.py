@@ -116,8 +116,20 @@ def load_sequences() -> tuple[np.ndarray, np.ndarray, list[int]]:
     enc_ids = enc_ids[valid_idx]
 
     # 🔥 NOW safe to apply nan_to_num
-    X = np.nan_to_num(X, nan=0.0)
-
+    # forward fill along time axis
+    for i in range(X.shape[0]):
+        for j in range(X.shape[2]):
+            col = X[i, :, j]
+            mask = np.isnan(col)
+            if np.all(mask):
+                X[i, :, j] = 0
+            else:
+                col[mask] = np.nanmean(col)
+                X[i, :, j] = col
+    # normalize per feature
+    mean = X.mean(axis=(0,1), keepdims=True)
+    std  = X.std(axis=(0,1), keepdims=True) + 1e-6
+    X = (X - mean) / std
     print(f"  X shape: {X.shape}  |  y shape: {y.shape}")
 
     print(f"  After balancing → samples: {len(y)}, pos rate: {y.mean():.2%}")
