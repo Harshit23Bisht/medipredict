@@ -279,6 +279,12 @@ class FusionPredictor:
         df = self._fetch_tabular(encounter_id)
         if df.empty:
             return 0.5   # neutral fallback
+        # 🔥 ensure all expected columns exist
+        for col in self.xgb_features:
+            if col not in df.columns:
+                df[col] = 0
+        if "gender" in df.columns:
+            df["gender"] = df["gender"].map({"M": 1, "F": 0})
         X = df[self.xgb_features].fillna(0).astype(float)
         return float(self.xgb_model.predict_proba(X)[0, 1])
 

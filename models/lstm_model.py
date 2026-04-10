@@ -97,7 +97,7 @@ def load_sequences() -> tuple[np.ndarray, np.ndarray, list[int]]:
         if len(arr) >= SEQ_LENGTH:
             arr = arr[-SEQ_LENGTH:]
         else:
-            pad = np.zeros((SEQ_LENGTH - len(arr), N_FEATURES), dtype=np.float32)
+            pad = np.full((SEQ_LENGTH - len(arr), N_FEATURES), np.nan)
             arr = np.vstack([pad, arr])
 
         enc_ids.append(eid)
@@ -106,39 +106,59 @@ def load_sequences() -> tuple[np.ndarray, np.ndarray, list[int]]:
 
     X = np.stack(sequences, axis=0)
     y = np.array(labels, dtype=int)
-    # 🔥 FIX: remove useless sequences (all zeros)
+    enc_ids = np.array(enc_ids)
+
+    # 🔥 remove empty sequences
     valid_idx = ~(X.sum(axis=(1, 2)) == 0)
+
     X = X[valid_idx]
     y = y[valid_idx]
+    enc_ids = enc_ids[valid_idx]
+
+    # 🔥 NOW safe to apply nan_to_num
+    X = np.nan_to_num(X, nan=0.0)
 
     print(f"  X shape: {X.shape}  |  y shape: {y.shape}")
-    # 🔥 FIX: balance dataset (your readmission rate is ~1%)
-    pos_idx = np.where(y == 1)[0]
-    neg_idx = np.where(y == 0)[0]
 
-    if len(pos_idx) > 0:
-        upsampled_pos = np.random.choice(pos_idx, size=len(neg_idx), replace=True)
-        new_idx = np.concatenate([neg_idx, upsampled_pos])
-        np.random.shuffle(new_idx)
-
-        X = X[new_idx]
-        y = y[new_idx]
-
-        print(f"  After balancing → samples: {len(y)}, pos rate: {y.mean():.2%}")
+    print(f"  After balancing → samples: {len(y)}, pos rate: {y.mean():.2%}")
     return X, y, enc_ids
 
 
 # ─────────────────────────────────────────────────────────────
 # 2. Chronological split
 # ─────────────────────────────────────────────────────────────
-def split_chronological(X, y):
-    n         = len(X)
-    train_end = int(n * 0.70)
+def split_by_encounter(X, y, enc_ids):
+    """
+    Proper split to avoid leakage.
+    Ensures no encounter appears in multiple splits.
+    """
+
+    df = pd.DataFrame({
+        "encounter_id": enc_ids,
+        "label": y
+    })
+
+    # sort by encounter_id (proxy for time)
+    df = df.sort_values("encounter_id")
+
+    n = len(df)
+    train_end = int(n * 0.7)
     val_end   = int(n * 0.85)
 
-    X_train, y_train = X[:train_end],        y[:train_end]
-    X_val,   y_val   = X[train_end:val_end], y[train_end:val_end]
-    X_test,  y_test  = X[val_end:],          y[val_end:]
+    train_ids = df.iloc[:train_end]["encounter_id"]
+    val_ids   = df.iloc[train_end:val_end]["encounter_id"]
+    test_ids  = df.iloc[val_end:]["encounter_id"]
+
+    def get_mask(ids):
+        return np.isin(enc_ids, ids)
+
+    train_mask = get_mask(train_ids)
+    val_mask   = get_mask(val_ids)
+    test_mask  = get_mask(test_ids)
+
+    X_train, y_train = X[train_mask], y[train_mask]
+    X_val,   y_val   = X[val_mask],   y[val_mask]
+    X_test,  y_test  = X[test_mask],  y[test_mask]
 
     for name, yy in [("Train", y_train), ("Val", y_val), ("Test", y_test)]:
         print(f"  {name:5s}: {len(yy):,}  readmit={yy.mean():.2%}")
@@ -186,7 +206,7 @@ class BiLSTM(nn.Module):
         )
         self.bn   = nn.BatchNorm1d(256)
         self.fc1  = nn.Linear(256, 64)
-        self.drop = nn.Dropout(0.3)
+        self.drop = nn.Dropout(0.5)
         self.fc2  = nn.Linear(64, 1)
 
     def forward(self, x):
@@ -230,7 +250,7 @@ def train_model(model, X_train, y_train, X_val, y_val):
         num_workers= 0,
     )
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=5e-4, weight_decay=1e-5)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="max", patience=3, factor=0.5
     )
@@ -402,7 +422,7 @@ if __name__ == "__main__":
     X, y, enc_ids = load_sequences()
 
     print("\nSplitting (chronological 70/15/15)...")
-    X_train, y_train, X_val, y_val, X_test, y_test = split_chronological(X, y)
+    X_train, y_train, X_val, y_val, X_test, y_test = split_by_encounter(X, y, enc_ids)
 
     print("\nNormalising...")
     X_train, X_val, X_test, scaler = normalise(X_train, X_val, X_test)

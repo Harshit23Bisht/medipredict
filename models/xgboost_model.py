@@ -25,6 +25,7 @@ from sklearn.metrics import (
     confusion_matrix, ConfusionMatrixDisplay,
     classification_report, roc_curve,
 )
+import xgboost as xgb
 from sklearn.dummy import DummyClassifier
 from xgboost import XGBClassifier
 from dotenv import load_dotenv
@@ -44,10 +45,12 @@ os.makedirs("eda_plots",   exist_ok=True)
 
 FEATURE_COLS = [
     "age_at_admission",
-    "gender",
     "length_of_stay",
     "num_diagnoses",
     "num_medications",
+    "avg_hr",
+    "max_bp_sys",
+    "avg_temp",
     "max_creatinine",
     "max_wbc",
     "num_prior_admissions",
@@ -96,7 +99,7 @@ def load_data() -> pd.DataFrame:
     query = text("""
         SELECT
             ef.encounter_id,
-            ef.admit_date,
+            ef.admit_time AS admit_date,
             ef.age_at_admission,
             ef.gender,
             ef.length_of_stay,
@@ -111,14 +114,22 @@ def load_data() -> pd.DataFrame:
             rl.readmitted_30d AS label
         FROM encounter_features ef
         JOIN readmission_label rl
-          ON rl.encounter_id = ef.encounter_id
+        ON rl.encounter_id = ef.encounter_id
         WHERE ef.length_of_stay > 0
-        ORDER BY ef.admit_date ASC
+        ORDER BY ef.admit_time ASC;
     """)
     with engine.connect() as conn:
         df = pd.read_sql(query, conn)
         # 🔥 FIX: better missing handling
-        df[FEATURE_COLS] = df[FEATURE_COLS].fillna(df[FEATURE_COLS].median())
+    # 🔥 Fix gender
+    df["gender"] = df["gender"].map({"M": 1, "F": 0})
+
+    # 🔥 Ensure numeric columns
+    for col in FEATURE_COLS:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # 🔥 Fill missing values
+    df[FEATURE_COLS] = df[FEATURE_COLS].fillna(df[FEATURE_COLS].median())
 
     print(f"  Total encounters : {len(df):,}")
     print(f"  Readmission rate : {df['label'].mean():.2%}")
@@ -167,11 +178,15 @@ def train_model(train: pd.DataFrame, val: pd.DataFrame):
 
     # ✅ Use ORIGINAL data (NO UPSAMPLING)
     X_train = train[FEATURE_COLS].fillna(0).astype(float)
+    # 🔥 FIX: remove fake zeros
+    for col in FEATURE_COLS:
+        X_train[col] = X_train[col].replace(0, np.nan)
+
+    X_train = X_train.fillna(X_train.median())
     y_train = train["label"].astype(int)
 
-    X_val = val[FEATURE_COLS].fillna(0).astype(float)
+    X_val = val[FEATURE_COLS].astype(float)
     y_val = val["label"].astype(int)
-
     # ✅ Proper class imbalance handling
     pos = int(y_train.sum())
     neg = len(y_train) - pos
@@ -181,28 +196,26 @@ def train_model(train: pd.DataFrame, val: pd.DataFrame):
           f"(pos={pos:,}  neg={neg:,})")
 
     # ✅ Stable model (prevents overfitting on weak data)
-    model = XGBClassifier(
-        n_estimators=150,
-        max_depth=3,
+    model = xgb.XGBClassifier(
+        n_estimators=600,
+        max_depth=4,
         learning_rate=0.03,
-        min_child_weight=20,
-        gamma=1.0,
         subsample=0.8,
         colsample_bytree=0.8,
-        reg_alpha=1.0,
-        reg_lambda=3.0,
         scale_pos_weight=scale_pos_wt,
+        reg_lambda=2,
+        reg_alpha=1,
+        min_child_weight=5,
         eval_metric="auc",
-        early_stopping_rounds=50,
-        tree_method="hist",
         random_state=42,
-        n_jobs=-1,
     )
 
     model.fit(
-        X_train, y_train,
+        X_train,
+        y_train,
         eval_set=[(X_val, y_val)],
-        verbose=50,
+        early_stopping_rounds=50,
+        verbose=True
     )
 
     print(f"  Best iteration   : {model.best_iteration}")
