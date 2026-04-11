@@ -16,14 +16,15 @@ Patches vs your original:
 import os
 import pickle
 from contextlib import asynccontextmanager
-
+import sys
 import torch
 import torchvision.models as tv_models
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
-from models.fusion import BiLSTM
+from models.lstm_model import BiLSTM
+sys.modules["__main__"].BiLSTM = BiLSTM
 load_dotenv()
 
 # ── Global model store ────────────────────────────────────────
